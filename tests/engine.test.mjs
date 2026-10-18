@@ -167,3 +167,43 @@ test("7. Asymmetric Ed25519 admin intents & replay defense", () => {
     /Nonce replay rejected/
   );
 });
+
+test("8. Oracle staleness & deviation circuit breaker protections", () => {
+  const { engine } = setupEngine();
+
+  // Attempting to set stale timestamp fails closed
+  const pastTime = Math.floor(Date.now() / 1000) - 4000; // older than 3600s
+  assert.throws(
+    () => engine.setOraclePriceDirect("WETH", 3100n * WAD, pastTime),
+    /ORACLE_PRICE_STALE/
+  );
+
+  // Attempting to exceed 50% deviation bounds fails closed without override
+  assert.throws(
+    () => engine.setOraclePriceDirect("WETH", 5000n * WAD), // 66% jump from 3000
+    /PRICE_DEVIATION_EXCEEDED/
+  );
+
+  // Emergency override bypasses deviation circuit breaker
+  engine.overrideOraclePriceDirect("WETH", 5000n * WAD);
+  assert.equal(engine.getOraclePrice("WETH"), 5000n * WAD);
+});
+
+test("9. Protocol bad debt accumulation on severe underwater shortfall", () => {
+  const { engine, alice, bob } = setupEngine();
+
+  const vault = engine.openVault(alice, "WETH");
+  engine.depositCollateral(vault.vaultId, alice, 1n * WAD); // 1 ETH
+  engine.mintStablecoin(vault.vaultId, alice, 1_500n * WAD); // $1500 debt
+
+  // Crash to $500/ETH
+  engine.overrideOraclePriceDirect("WETH", 500n * WAD);
+
+  // Bob liquidates 1500 QUSD debt. The vault only has 1 ETH ($500).
+  const liq = engine.liquidateVault(vault.vaultId, bob, 1_500n * WAD);
+  assert.equal(liq.success, true);
+  assert.equal(liq.collateralDelta, -1n * WAD);
+
+  // Assert bad debt was tracked
+  assert.ok(engine.getProtocolBadDebt() > 0n);
+});

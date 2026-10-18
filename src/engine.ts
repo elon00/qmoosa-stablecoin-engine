@@ -5,11 +5,13 @@ import {
   VaultHealth,
   VaultOperationResult,
   SignedAdminIntent,
+  OraclePriceFeed,
   calculateCollateralValue,
   calculateCollateralRatio,
   calculateMaxMintableDebt,
   calculateStabilityFeeAccrual,
   calculateLiquidationSeizure,
+  calculateBadDebtShortfall,
   isVaultSolvent,
   BPS_DIVISOR,
   WAD
@@ -19,10 +21,14 @@ import { AdminAuthManager } from "./auth.js";
 export class StablecoinEngine {
   private readonly vaults: Map<string, VaultPosition> = new Map();
   private readonly collaterals: Map<string, CollateralConfig> = new Map();
-  private readonly oraclePrices: Map<string, bigint> = new Map();
+  private readonly oracleFeeds: Map<string, OraclePriceFeed> = new Map();
   private readonly authManager: AdminAuthManager;
   private readonly chainId: number;
   private vaultCounter: number = 0;
+
+  public maxOracleStaleness: number = 3600; // 1 hour max staleness
+  public maxPriceDeviationBps: bigint = 5000n; // max 50% deviation
+  public protocolBadDebt: bigint = 0n; // cumulative bad debt deficit ledger
 
   // Mock ledger balances for simulation and testing
   private readonly collateralBalances: Map<string, bigint> = new Map(); // "user:token" -> balance
@@ -38,11 +44,56 @@ export class StablecoinEngine {
     this.collaterals.set(config.token, { ...config });
   }
 
-  public setOraclePriceDirect(token: string, priceWad: bigint): void {
+  public setOraclePriceDirect(
+    token: string,
+    priceWad: bigint,
+    updatedAt?: number,
+    bypassDeviationCheck: boolean = false
+  ): void {
     if (priceWad <= 0n) {
       throw new RangeError("INVALID_ORACLE_PRICE: Price must be strictly positive");
     }
-    this.oraclePrices.set(token, priceWad);
+    const now = Math.floor(Date.now() / 1000);
+    const timestamp = updatedAt ?? now;
+
+    if (timestamp > now) {
+      throw new Error("FUTURE_TIMESTAMP: Oracle price timestamp cannot be in the future");
+    }
+    if (now - timestamp > this.maxOracleStaleness) {
+      throw new Error("ORACLE_PRICE_STALE: Supplied timestamp is older than max staleness");
+    }
+
+    const existing = this.oracleFeeds.get(token);
+    if (!bypassDeviationCheck && existing && existing.priceWad > 0n) {
+      const prev = existing.priceWad;
+      const diff = priceWad > prev ? priceWad - prev : prev - priceWad;
+      const devBps = (diff * BPS_DIVISOR) / prev;
+      if (devBps > this.maxPriceDeviationBps) {
+        throw new Error("PRICE_DEVIATION_EXCEEDED: New price deviates beyond permissible circuit breaker bounds");
+      }
+    }
+
+    this.oracleFeeds.set(token, { priceWad, updatedAt: timestamp });
+  }
+
+  public overrideOraclePriceDirect(token: string, priceWad: bigint): void {
+    this.setOraclePriceDirect(token, priceWad, undefined, true);
+  }
+
+  public getOraclePrice(token: string): bigint {
+    const feed = this.oracleFeeds.get(token);
+    if (!feed || feed.priceWad <= 0n) {
+      throw new Error("ORACLE_PRICE_NOT_SET");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (now - feed.updatedAt > this.maxOracleStaleness) {
+      throw new Error("ORACLE_PRICE_STALE");
+    }
+    return feed.priceWad;
+  }
+
+  public getProtocolBadDebt(): bigint {
+    return this.protocolBadDebt;
   }
 
   public setUserCollateralBalance(user: string, token: string, balance: bigint): void {
@@ -94,8 +145,13 @@ export class StablecoinEngine {
         break;
       }
       case "SET_ORACLE_PRICE": {
+        const { token, priceWad, updatedAt } = intent.params;
+        this.setOraclePriceDirect(token, BigInt(priceWad), updatedAt ? Number(updatedAt) : undefined, false);
+        break;
+      }
+      case "OVERRIDE_ORACLE_PRICE": {
         const { token, priceWad } = intent.params;
-        this.setOraclePriceDirect(token, BigInt(priceWad));
+        this.overrideOraclePriceDirect(token, BigInt(priceWad));
         break;
       }
       case "SET_PAUSED": {
@@ -316,17 +372,22 @@ export class StablecoinEngine {
     }
 
     const config = this.collaterals.get(vault.collateralToken)!;
-    const price = this.oraclePrices.get(vault.collateralToken)!;
+    const price = this.getOraclePrice(vault.collateralToken);
 
     const actualCover = debtToCover > vault.debtAmount ? vault.debtAmount : debtToCover;
-    const { collateralToSeize } = calculateLiquidationSeizure(
+    const { collateralToSeize, badDebtShortfall } = calculateBadDebtShortfall(
       actualCover,
+      vault.collateralAmount,
       price,
       config.decimals,
       config.liquidationPenaltyBps
     );
 
-    const seized = collateralToSeize > vault.collateralAmount ? vault.collateralAmount : collateralToSeize;
+    if (badDebtShortfall > 0n) {
+      this.protocolBadDebt += badDebtShortfall;
+    }
+
+    const seized = collateralToSeize;
 
     vault.debtAmount -= actualCover;
     vault.collateralAmount -= seized;
@@ -362,7 +423,7 @@ export class StablecoinEngine {
     const config = this.collaterals.get(vault.collateralToken);
     if (!config) throw new Error("COLLATERAL_NOT_REGISTERED");
 
-    const price = this.oraclePrices.get(vault.collateralToken) ?? 0n;
+    const price = this.getOraclePrice(vault.collateralToken);
     const collateralValueWad = calculateCollateralValue(vault.collateralAmount, price, config.decimals);
     const ratioBps = calculateCollateralRatio(collateralValueWad, vault.debtAmount);
     const solvent = isVaultSolvent(collateralValueWad, vault.debtAmount, config.minCollateralRatioBps);
@@ -388,10 +449,11 @@ export class StablecoinEngine {
     const elapsed = BigInt(now - vault.lastAccrualTimestamp);
     if (elapsed > 0n) {
       const config = this.collaterals.get(vault.collateralToken);
-      if (config) {
+      if (config && config.stabilityFeeBps > 0n) {
         const interest = calculateStabilityFeeAccrual(vault.debtAmount, config.stabilityFeeBps, elapsed);
         vault.debtAmount += interest;
         vault.accruedInterest += interest;
+        // Debt ceiling policy: allow interest to accrue even if debt ceiling is reached
         config.totalDebtIssued += interest;
         this.protocolFeesAccrued += interest;
       }

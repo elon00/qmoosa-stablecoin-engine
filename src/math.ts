@@ -59,6 +59,7 @@ export function calculateMaxMintableDebt(
 
 /**
  * Computes continuous stability fee interest accrued on outstanding debt over an elapsed time window
+ * Implements continuous second-order compounding approximation: I = Linear + (Linear * r * t) / (2 * BPS * YEAR)
  */
 export function calculateStabilityFeeAccrual(
   principalDebt: bigint,
@@ -72,7 +73,9 @@ export function calculateStabilityFeeAccrual(
     return 0n;
   }
 
-  return (principalDebt * stabilityFeeBps * elapsedSeconds) / (BPS_DIVISOR * SECONDS_PER_YEAR);
+  const linear = (principalDebt * stabilityFeeBps * elapsedSeconds) / (BPS_DIVISOR * SECONDS_PER_YEAR);
+  const compoundTerm = (linear * stabilityFeeBps * elapsedSeconds) / (2n * BPS_DIVISOR * SECONDS_PER_YEAR);
+  return linear + compoundTerm;
 }
 
 /**
@@ -99,6 +102,35 @@ export function calculateLiquidationSeizure(
   const penaltyCollateral = (collateralToSeize * liquidationPenaltyBps) / (BPS_DIVISOR + liquidationPenaltyBps);
 
   return { collateralToSeize, penaltyCollateral };
+}
+
+/**
+ * Evaluates shortfall and bad debt deficit when collateral seized is capped by available vault balance
+ */
+export function calculateBadDebtShortfall(
+  debtToRepay: bigint,
+  collateralAvailable: bigint,
+  priceWad: bigint,
+  collateralDecimals: number = 18,
+  liquidationPenaltyBps: bigint = 1000n
+): { collateralToSeize: bigint; badDebtShortfall: bigint } {
+  const { collateralToSeize: theoreticalSeize } = calculateLiquidationSeizure(
+    debtToRepay,
+    priceWad,
+    collateralDecimals,
+    liquidationPenaltyBps
+  );
+
+  if (theoreticalSeize <= collateralAvailable) {
+    return { collateralToSeize: theoreticalSeize, badDebtShortfall: 0n };
+  }
+
+  const actualSeized = collateralAvailable;
+  const actualSeizedValueWad = (actualSeized * priceWad) / (10n ** BigInt(collateralDecimals));
+  const coveredDebt = (actualSeizedValueWad * BPS_DIVISOR) / (BPS_DIVISOR + liquidationPenaltyBps);
+  const badDebtShortfall = debtToRepay > coveredDebt ? debtToRepay - coveredDebt : 0n;
+
+  return { collateralToSeize: actualSeized, badDebtShortfall };
 }
 
 /**

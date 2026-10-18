@@ -4,8 +4,14 @@ export * from "./math.js";
 export type AdminActionType =
   | "SET_COLLATERAL_CONFIG"
   | "SET_ORACLE_PRICE"
+  | "OVERRIDE_ORACLE_PRICE"
   | "SET_PAUSED"
   | "SET_DEBT_CEILING";
+
+export interface OraclePriceFeed {
+  priceWad: bigint;
+  updatedAt: number;
+}
 
 export interface SignedAdminIntent {
   action: AdminActionType;
